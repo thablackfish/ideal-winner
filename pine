@@ -1,0 +1,505 @@
+//@version=5
+indicator("Market Structure (7/7) + Protected CHoCH (HUD top-right + 1H filter) + Vector Entry", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// === Inputs
+leftBars  = input.int(7, "Pivot Left Bars", minval=1)
+rightBars = input.int(7, "Pivot Right Bars", minval=1)
+
+showSwingLabels = input.bool(true, "Show HH/HL/LH/LL labels")
+showProtected   = input.bool(true, "Show Protected (PL/PH) lines")
+showChochLines  = input.bool(true, "Convert Protected line into CHoCH on break")
+lineExtendBars  = input.int(200, "Line extend bars", minval=10)
+
+breakOn   = input.string("Wick", "Break condition", options=["Close","Wick"])
+
+// === HTF Filter
+useHTFFilter = input.bool(true, "Use HTF (1H) Bias Filter")
+htfTf        = input.timeframe("60", "HTF timeframe")
+
+showHUD   = input.bool(true, "Show status HUD (top-right)")
+
+// === Break sources
+srcUp = breakOn == "Close" ? close : high
+srcDn = breakOn == "Close" ? close : low
+
+// === “First break” detectors
+f_firstBreakUp(_lvl) =>
+    not na(_lvl) and srcUp > _lvl and nz(srcUp[1], srcUp) <= _lvl
+
+f_firstBreakDn(_lvl) =>
+    not na(_lvl) and srcDn < _lvl and nz(srcDn[1], srcDn) >= _lvl
+
+// === HTF bias function (safe for request.security)
+f_getBias(_left, _right, _useCloseBreak) =>
+    _ph = ta.pivothigh(high, _left, _right)
+    _pl = ta.pivotlow(low,  _left, _right)
+
+    var float _lastH = na
+    var float _lastL = na
+    var float _lastBrokenH = na
+    var float _lastBrokenL = na
+    var int   _bias = 0
+
+    float _srcUp = _useCloseBreak ? close : high
+    float _srcDn = _useCloseBreak ? close : low
+
+    if not na(_ph)
+        _lastH := _ph
+    if not na(_pl)
+        _lastL := _pl
+
+    bool _bosUp = not na(_lastH) and _srcUp > _lastH
+    bool _bosDn = not na(_lastL) and _srcDn < _lastL
+
+    _bosUp := _bosUp and (na(_lastBrokenH) or _lastBrokenH != _lastH)
+    _bosDn := _bosDn and (na(_lastBrokenL) or _lastBrokenL != _lastL)
+
+    if _bosUp
+        _bias := 1
+        _lastBrokenH := _lastH
+    if _bosDn
+        _bias := -1
+        _lastBrokenL := _lastL
+
+    _bias
+
+useCloseBreak = breakOn == "Close"
+biasHTF = request.security(syminfo.tickerid, htfTf, f_getBias(leftBars, rightBars, useCloseBreak))
+
+// === Pivot detection (confirmed after rightBars)
+ph = ta.pivothigh(high, leftBars, rightBars)
+pl = ta.pivotlow(low, leftBars, rightBars)
+phBar = bar_index - rightBars
+plBar = bar_index - rightBars
+
+// === Track swings
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+// Swing classification memory
+var float prevSwingHigh = na
+var float prevSwingLow  = na
+
+// === Bias:  1 bullish, -1 bearish, 0 unknown
+var int bias = 0
+
+// === Protected swings
+var float protectedLow  = na
+var float protectedHigh = na
+var int   lastBosBar    = na
+
+// === Visual objects for protected levels
+var line plLine = na
+var line phLine = na
+
+// === NEW: shared reset flag (used by vector entry block later)
+var bool resetVecState = false
+
+// === Save swings + optional HH/HL/LH/LL labels
+if not na(ph)
+    string tagH = na(prevSwingHigh) ? "H" : (ph > prevSwingHigh ? "HH" : "LH")
+    prevSwingHigh := ph
+    lastSwingHigh := ph
+
+    if showSwingLabels
+        label.new(phBar, ph, tagH, style=label.style_label_down, textcolor=color.white,
+          color=tagH == "HH" ? color.new(color.lime, 0) : color.new(color.orange, 0), size=size.small)
+
+    // In bearish bias: update Protected High with pivot highs AFTER BOS
+    if bias == -1 and (na(lastBosBar) or phBar > lastBosBar)
+        protectedHigh := ph
+        if showProtected
+            if not na(phLine)
+                line.delete(phLine)
+            phLine := line.new(phBar, protectedHigh, phBar + lineExtendBars, protectedHigh, color=color.new(color.purple, 0), width=2)
+            label.new(phBar, ph, "PH", style=label.style_label_down, textcolor=color.white,
+              color=color.new(color.purple, 0), size=size.tiny)
+
+if not na(pl)
+    string tagL = na(prevSwingLow) ? "L" : (pl < prevSwingLow ? "LL" : "HL")
+    prevSwingLow := pl
+    lastSwingLow := pl
+
+    if showSwingLabels
+        label.new(plBar, pl, tagL, style=label.style_label_up, textcolor=color.white,
+          color=tagL == "LL" ? color.new(color.red, 0) : color.new(color.aqua, 0), size=size.small)
+
+    // In bullish bias: update Protected Low with pivot lows AFTER BOS
+    if bias == 1 and (na(lastBosBar) or plBar > lastBosBar)
+        protectedLow := pl
+        if showProtected
+            if not na(plLine)
+                line.delete(plLine)
+            plLine := line.new(plBar, protectedLow, plBar + lineExtendBars, protectedLow, color=color.new(color.blue, 0), width=2)
+            label.new(plBar, pl, "PL", style=label.style_label_up, textcolor=color.white,
+              color=color.new(color.blue, 0), size=size.tiny)
+
+// === BOS detection
+bool bosUp = not na(lastSwingHigh) and srcUp > lastSwingHigh
+bool bosDn = not na(lastSwingLow)  and srcDn < lastSwingLow
+
+// Fire only once per swing level (avoid spam)
+var float lastBrokenHigh = na
+var float lastBrokenLow  = na
+bosUp := bosUp and (na(lastBrokenHigh) or lastBrokenHigh != lastSwingHigh)
+bosDn := bosDn and (na(lastBrokenLow)  or lastBrokenLow  != lastSwingLow)
+
+if bosUp
+    resetVecState := true
+    bias := 1
+    lastBosBar := bar_index
+    lastBrokenHigh := lastSwingHigh
+    protectedLow := na
+    if not na(plLine)
+        line.delete(plLine)
+        plLine := na
+
+if bosDn
+    resetVecState := true
+    bias := -1
+    lastBosBar := bar_index
+    lastBrokenLow := lastSwingLow
+    protectedHigh := na
+    if not na(phLine)
+        line.delete(phLine)
+        phLine := na
+
+// === CHoCH detection using Protected levels
+chochDn = bias == 1  and f_firstBreakDn(protectedLow)
+chochUp = bias == -1 and f_firstBreakUp(protectedHigh)
+
+// Convert protected line into CHoCH line on break
+if showChochLines and chochDn
+    resetVecState := true
+    if not na(plLine)
+        line.set_color(plLine, color.new(color.red, 0))
+        line.set_width(plLine, 3)
+        line.set_x2(plLine, bar_index + lineExtendBars)
+    label.new(bar_index, protectedLow, "CHoCH ↓", style=label.style_label_up,
+      color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+
+    bias := -1
+    lastBosBar := bar_index
+    protectedHigh := na
+    if not na(phLine)
+        line.delete(phLine)
+        phLine := na
+
+if showChochLines and chochUp
+    resetVecState := true
+    if not na(phLine)
+        line.set_color(phLine, color.new(color.lime, 0))
+        line.set_width(phLine, 3)
+        line.set_x2(phLine, bar_index + lineExtendBars)
+    label.new(bar_index, protectedHigh, "CHoCH ↑", style=label.style_label_down,
+      color=color.new(color.lime, 0), textcolor=color.white, size=size.small)
+
+    bias := 1
+    lastBosBar := bar_index
+    protectedLow := na
+    if not na(plLine)
+        line.delete(plLine)
+        plLine := na
+
+// === Trade permission flags using HTF filter
+allowLong  = bias == 1  and (not useHTFFilter or biasHTF == 1)
+allowShort = bias == -1 and (not useHTFFilter or biasHTF == -1)
+
+// === HUD (top-right) via table
+var table hudTbl = na
+if showHUD and barstate.isfirst
+    hudTbl := table.new(position.top_right, 1, 7, border_width=1)
+
+if showHUD and barstate.islast and not na(hudTbl)
+    biasTxt    = bias == 1 ? "Bullish" : bias == -1 ? "Bearish" : "Unknown"
+    htfBiasTxt = biasHTF == 1 ? "Bullish" : biasHTF == -1 ? "Bearish" : "Unknown"
+
+    plSet = not na(protectedLow)
+    phSet = not na(protectedHigh)
+
+    nextTxt =
+         bias == 1 ? (plSet ? "CHoCH if breaks BELOW PL" : "Waiting PL (pullback low pivot)") :
+         bias == -1 ? (phSet ? "CHoCH if breaks ABOVE PH" : "Waiting PH (pullback high pivot)") :
+         "Waiting first BOS to set bias"
+
+    tradeTxt =
+         allowLong  ? "Allowed: LONG" :
+         allowShort ? "Allowed: SHORT" :
+         "Allowed: NONE"
+
+    table.cell(hudTbl, 0, 0, "Structure HUD", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(hudTbl, 0, 1, "Bias (LTF): " + biasTxt, text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(hudTbl, 0, 2, "Bias (HTF " + htfTf + "): " + htfBiasTxt, text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(hudTbl, 0, 3, "Break: " + breakOn, text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(hudTbl, 0, 4, "PL: " + (plSet ? str.tostring(protectedLow, format.mintick) : "na"), text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(hudTbl, 0, 5, "PH: " + (phSet ? str.tostring(protectedHigh, format.mintick) : "na"), text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(hudTbl, 0, 6, tradeTxt + "\nNext: " + nextTxt, text_color=color.white, bgcolor=color.new(color.black, 0))
+
+// ─────────────────────────────────────────────────────────────
+// MINIMAL LIQUIDITY (Nearest Above/Below + optional PDH/PDL + prev 4H)
+// Boxes only, no clutter.
+// ─────────────────────────────────────────────────────────────
+showNearestSwingLiq = input.bool(true, "Show Nearest Swing Liquidity Boxes")
+showPDH_PDL         = input.bool(true, "Show PDH/PDL Boxes")
+showPrev4H          = input.bool(false, "Show Prev 4H High/Low Boxes")
+
+liqExtendBars = input.int(250, "Liquidity box extend", minval=50)
+atrLenLiq     = input.int(14, "Liq ATR length", minval=1)
+liqAtrMult    = input.float(0.08, "Liq thickness (ATR mult)", minval=0.01, step=0.01)
+
+atrL = ta.atr(atrLenLiq)
+thL  = atrL * liqAtrMult
+
+// Track nearest pivot high above and pivot low below
+var float nearHigh = na
+var int   nearHighBar = na
+var float nearLow  = na
+var int   nearLowBar  = na
+
+if not na(ph)
+    if ph > close
+        if na(nearHigh) or ph < nearHigh
+            nearHigh := ph
+            nearHighBar := phBar
+
+if not na(pl)
+    if pl < close
+        if na(nearLow) or pl > nearLow
+            nearLow := pl
+            nearLowBar := plBar
+
+// Reset nearest levels when price moves through them
+if not na(nearHigh) and high >= nearHigh
+    nearHigh := na
+    nearHighBar := na
+if not na(nearLow) and low <= nearLow
+    nearLow := na
+    nearLowBar := na
+
+// Boxes (only 2 swing boxes total)
+var box bNearHigh = na
+var box bNearLow  = na
+
+f_setBox(_b, _left, _lvl, _txt, _bg, _brd) =>
+    box result = _b
+    if na(_lvl) or na(_left)
+        if not na(result)
+            box.delete(result)
+        result := na
+    else
+        if na(result)
+            result := box.new(_left, _lvl + thL, _left + liqExtendBars, _lvl - thL, bgcolor=_bg, border_color=_brd, text=_txt, text_color=color.white)
+        else
+            box.set_left(result, _left)
+            box.set_right(result, bar_index + liqExtendBars)
+            box.set_top(result, _lvl + thL)
+            box.set_bottom(result, _lvl - thL)
+            box.set_text(result, _txt)
+    result
+
+if showNearestSwingLiq
+    bNearHigh := f_setBox(bNearHigh, nz(nearHighBar, bar_index), nearHigh, "Nearest BSL", color.new(color.lime, 85), color.new(color.lime, 0))
+    bNearLow  := f_setBox(bNearLow,  nz(nearLowBar,  bar_index), nearLow,  "Nearest SSL", color.new(color.red, 85),  color.new(color.red, 0))
+else
+    if not na(bNearHigh)
+        box.delete(bNearHigh), bNearHigh := na
+    if not na(bNearLow)
+        box.delete(bNearLow), bNearLow := na
+
+// ───────── PDH/PDL boxes (only 2) ─────────
+pdh = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  barmerge.gaps_off, barmerge.lookahead_off)
+newDay = ta.change(time("D"))
+
+var box bPDH = na
+var box bPDL = na
+
+if showPDH_PDL
+    if newDay
+        if not na(bPDH)
+            box.delete(bPDH)
+        if not na(bPDL)
+            box.delete(bPDL)
+        bPDH := box.new(bar_index, pdh + thL, bar_index + liqExtendBars, pdh - thL, bgcolor=color.new(color.fuchsia, 88), border_color=color.new(color.fuchsia, 0), text="PDH", text_color=color.white)
+        bPDL := box.new(bar_index, pdl + thL, bar_index + liqExtendBars, pdl - thL, bgcolor=color.new(color.blue, 88), border_color=color.new(color.blue, 0), text="PDL", text_color=color.white)
+    if not na(bPDH)
+        box.set_right(bPDH, bar_index + liqExtendBars)
+    if not na(bPDL)
+        box.set_right(bPDL, bar_index + liqExtendBars)
+else
+    if not na(bPDH)
+        box.delete(bPDH), bPDH := na
+    if not na(bPDL)
+        box.delete(bPDL), bPDL := na
+
+// ───────── Prev 4H boxes (optional, only 2) ─────────
+ph4 = request.security(syminfo.tickerid, "240", high[1], barmerge.gaps_off, barmerge.lookahead_off)
+pl4 = request.security(syminfo.tickerid, "240", low[1],  barmerge.gaps_off, barmerge.lookahead_off)
+new4H = ta.change(time("240"))
+
+var box b4Hh = na
+var box b4Hl = na
+
+if showPrev4H
+    if new4H
+        if not na(b4Hh)
+            box.delete(b4Hh)
+        if not na(b4Hl)
+            box.delete(b4Hl)
+        b4Hh := box.new(bar_index, ph4 + thL, bar_index + liqExtendBars, ph4 - thL, bgcolor=color.new(color.gray, 90), border_color=color.new(color.gray, 0), text="Prev 4H High", text_color=color.white)
+        b4Hl := box.new(bar_index, pl4 + thL, bar_index + liqExtendBars, pl4 - thL, bgcolor=color.new(color.gray, 90), border_color=color.new(color.gray, 0), text="Prev 4H Low", text_color=color.white)
+    if not na(b4Hh)
+        box.set_right(b4Hh, bar_index + liqExtendBars)
+    if not na(b4Hl)
+        box.set_right(b4Hl, bar_index + liqExtendBars)
+else
+    if not na(b4Hh)
+        box.delete(b4Hh), b4Hh := na
+    if not na(b4Hl)
+        box.delete(b4Hl), b4Hl := na
+
+// ─────────────────────────────────────────────────────────────
+// VECTOR CANDLE → FROZEN ZONE → ENTRY TRIGGER + PL/PH GUARD
+// (portable, no library, one entry per structure cycle)
+// ─────────────────────────────────────────────────────────────
+groupVC = "Vector Entry"
+
+useVector = input.bool(true, "Use Vector Entry Trigger", group=groupVC)
+vLen      = input.int(10, "Vector avg len", group=groupVC)
+vStrong   = input.float(2.0, "Strong mult (200%)", step=0.1, group=groupVC)
+vMedium   = input.float(1.5, "Medium mult (150%)", step=0.1, group=groupVC)
+confirmVecOnClose = input.bool(true, "Confirm vector on bar close", group=groupVC)
+
+zoneFrom  = input.string("Wicks", "Frozen zone from", options=["Wicks","Body"], group=groupVC)
+entryMode = input.string("Touch", "Entry mode", options=["Touch","CloseInside"], group=groupVC)
+
+freezeAfter = input.string("PL/PH", "Freeze after", options=["PL/PH","BOS"], group=groupVC)
+oneEntryPerZone = input.bool(true, "One entry per frozen zone", group=groupVC)
+
+guardMode = input.string("Close", "PL/PH Guard uses", options=["Close","Wick"], group=groupVC)
+
+showFrozenBox = input.bool(true, "Show Frozen Vector Box", group=groupVC)
+boxExtendBars = input.int(80, "Frozen box extend bars", minval=10, group=groupVC)
+
+vecRed    = input.color(color.red, "Bear strong", group=groupVC, inline="vcc")
+vecGreen  = input.color(color.lime, "Bull strong", group=groupVC, inline="vcc")
+vecViolet = input.color(color.fuchsia, "Bear med", group=groupVC, inline="vcc2")
+vecBlue   = input.color(color.blue, "Bull med", group=groupVC, inline="vcc2")
+
+// --- Vector detection (PVSRA-ish)
+volAvg = ta.sma(volume, vLen)
+isBull = close >= open
+isBear = close < open
+
+isStrong = volume >= volAvg * vStrong
+isMed    = volume >= volAvg * vMedium and not isStrong
+
+isVectorRaw = isStrong or isMed
+isVector = confirmVecOnClose ? (barstate.isconfirmed and isVectorRaw) : isVectorRaw
+
+vecColor =
+     not isVector ? na :
+     isStrong and isBull ? vecGreen :
+     isStrong and isBear ? vecRed :
+     isMed and isBull ? vecBlue :
+     vecViolet
+
+// --- Track last confirmed vector candle
+var int   lastVecBar = na
+var float lastVecTop = na
+var float lastVecBot = na
+var color lastVecCol = na
+
+if useVector and isVector
+    float topZ = zoneFrom == "Body" ? math.max(open, close) : high
+    float botZ = zoneFrom == "Body" ? math.min(open, close) : low
+    lastVecBar := bar_index
+    lastVecTop := topZ
+    lastVecBot := botZ
+    lastVecCol := vecColor
+
+// --- Frozen zone + lockout
+var bool  vecFrozen = false
+var int   frozenVecBar = na
+var float frozenTop = na
+var float frozenBot = na
+var color frozenCol = na
+var bool  entryUsed = false
+
+// Reset when structure changes
+if resetVecState
+    vecFrozen := false
+    frozenVecBar := na
+    frozenTop := na
+    frozenBot := na
+    frozenCol := na
+    entryUsed := false
+    resetVecState := false
+
+freezeReady =
+     freezeAfter == "BOS" ? not na(lastBosBar) :
+     (bias == 1 and not na(protectedLow)) or (bias == -1 and not na(protectedHigh))
+
+vecIsAfterBos = not na(lastBosBar) and not na(lastVecBar) and lastVecBar > lastBosBar
+
+// Freeze the latest vector candle for this cycle
+if useVector and not vecFrozen and freezeReady and vecIsAfterBos and not na(lastVecBar)
+    vecFrozen := true
+    frozenVecBar := lastVecBar
+    frozenTop := lastVecTop
+    frozenBot := lastVecBot
+    frozenCol := lastVecCol
+    entryUsed := false
+
+// Entry trigger: mitigation of frozen zone
+inZoneTouch = vecFrozen and not na(frozenTop) and not na(frozenBot) and high >= frozenBot and low <= frozenTop
+inZoneClose = vecFrozen and not na(frozenTop) and not na(frozenBot) and close <= frozenTop and close >= frozenBot
+enterNow    = entryMode == "Touch" ? inZoneTouch : inZoneClose
+
+// PL/PH Guards
+longGuardOk = not na(protectedLow) and ( guardMode == "Close" ? close > protectedLow : low > protectedLow)
+
+shortGuardOk =not na(protectedHigh) and ( guardMode == "Close" ? close < protectedHigh : high < protectedHigh)
+
+// Optional hard invalidation: if guard fails, nuke frozen zone
+if vecFrozen
+    if bias == 1 and not longGuardOk
+        resetVecState := true
+    if bias == -1 and not shortGuardOk
+        resetVecState := true
+
+// Signals
+longSignal  = useVector and vecFrozen and allowLong  and enterNow and longGuardOk  and (not oneEntryPerZone or not entryUsed)
+shortSignal = useVector and vecFrozen and allowShort and enterNow and shortGuardOk and (not oneEntryPerZone or not entryUsed)
+
+if longSignal or shortSignal
+    entryUsed := true
+
+plotshape(longSignal,  title="Vector Long Entry",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 0), text="V-L", size=size.tiny)
+plotshape(shortSignal, title="Vector Short Entry", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0),  text="V-S", size=size.tiny)
+
+alertcondition(longSignal,  title="Vector Long Entry",  message="{{ticker}} Vector LONG entry on {{interval}}")
+alertcondition(shortSignal, title="Vector Short Entry", message="{{ticker}} Vector SHORT entry on {{interval}}")
+
+// Draw Frozen Zone box (single)
+var box bFrozen = na
+if showFrozenBox and useVector
+    if vecFrozen and not na(frozenVecBar)
+        if na(bFrozen)
+            bFrozen := box.new(frozenVecBar, frozenTop, frozenVecBar + boxExtendBars, frozenBot, bgcolor=color.new(frozenCol, 85), border_color=color.new(frozenCol, 0), text="Frozen VCZ", text_color=color.white)
+        else
+            box.set_left(bFrozen, frozenVecBar)
+            box.set_right(bFrozen, bar_index + boxExtendBars)
+            box.set_top(bFrozen, frozenTop)
+            box.set_bottom(bFrozen, frozenBot)
+            box.set_bgcolor(bFrozen, color.new(frozenCol, 85))
+            box.set_border_color(bFrozen, color.new(frozenCol, 0))
+            box.set_text(bFrozen, "Frozen VCZ")
+    else
+        if not na(bFrozen)
+            box.delete(bFrozen)
+            bFrozen := na
+else
+    if not na(bFrozen)
+        box.delete(bFrozen)
+        bFrozen := na
